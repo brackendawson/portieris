@@ -15,7 +15,13 @@ package multi
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"syscall"
 	"testing"
 
 	"github.com/IBM/portieris/helpers/credential"
@@ -81,6 +87,9 @@ func (msv *mockSimpleVerifier) VerifyByPolicy(imageToVerify string, credentials 
 }
 
 func Test_enforcer_DigestByPolicy(t *testing.T) {
+	errEOF := &url.Error{Err: io.EOF}                                           // retryable
+	errConRef := &net.OpError{Err: &os.SyscallError{Err: syscall.ECONNREFUSED}} // retryable
+	errNXDom := &url.Error{Err: &net.OpError{Err: &net.DNSError{}}}             // fatal
 	type transformPoliciesMock struct {
 		policy *signature.Policy
 		err    error
@@ -95,9 +104,10 @@ func Test_enforcer_DigestByPolicy(t *testing.T) {
 		err            error
 	}
 	type simpleVerifyByPolicyMock struct {
-		digest string
-		deny   error
-		err    error
+		digest    string
+		deny      error
+		retryErrs []error
+		err       error
 	}
 	type removeRegistryDirMock struct {
 		err error
@@ -230,7 +240,7 @@ func Test_enforcer_DigestByPolicy(t *testing.T) {
 			},
 			wantDigest: "",
 			wantDeny:   nil,
-			wantErr:    fmt.Errorf("simple: still bust"),
+			wantErr:    fmt.Errorf("simple: %w", errors.New("still bust")),
 		},
 		{
 			name:      "If simple signing VerifyByPolicy says deny, deny",
@@ -261,7 +271,7 @@ func Test_enforcer_DigestByPolicy(t *testing.T) {
 			},
 			removeRegistryDir: &removeRegistryDirMock{},
 			wantDigest:        "",
-			wantDeny:          fmt.Errorf("simple: policy denied the request: not allowed"),
+			wantDeny:          fmt.Errorf("simple: policy denied the request: %w", errors.New("not allowed")),
 			wantErr:           nil,
 		},
 		{
@@ -330,6 +340,106 @@ func Test_enforcer_DigestByPolicy(t *testing.T) {
 			wantDeny:   nil,
 			wantErr:    nil,
 		},
+		{
+			name:      "Allow access if simple signing allowed after 2 retryable errors",
+			namespace: "wibble",
+			imageName: "icr.io/wibble/some:tag",
+			policy: &policyv1.Policy{
+				Simple: policyv1.Simple{
+					Requirements: []policyv1.SimpleRequirement{
+						{
+							Type:      "test",
+							KeySecret: "noOneCares",
+						},
+					},
+					StoreURL:    "some.url.com",
+					StoreSecret: "someSecret1234",
+				},
+			},
+			transformPolicies: &transformPoliciesMock{},
+			getBasicCredentials: &getBasicCredentialsMock{
+				storeUser:     "sillyUser",
+				storePassword: "password1234",
+			},
+			createRegistryDir: &createRegistryDirMock{
+				storeConfigDir: "vault",
+			},
+			simpleVerifyByPolicy: &simpleVerifyByPolicyMock{
+				retryErrs: []error{
+					errEOF,
+					errConRef,
+				},
+				digest: "sha256@sdfghjkj",
+			},
+			removeRegistryDir: &removeRegistryDirMock{},
+			wantDigest:        "sha256@sdfghjkj",
+			wantDeny:          nil,
+			wantErr:           nil,
+		},
+		{
+			name:      "Return err if simple signing allowed after 3 retryable errors",
+			namespace: "wibble",
+			imageName: "icr.io/wibble/some:tag",
+			policy: &policyv1.Policy{
+				Simple: policyv1.Simple{
+					Requirements: []policyv1.SimpleRequirement{
+						{
+							Type:      "test",
+							KeySecret: "noOneCares",
+						},
+					},
+					StoreURL:    "some.url.com",
+					StoreSecret: "someSecret1234",
+				},
+			},
+			transformPolicies: &transformPoliciesMock{},
+			getBasicCredentials: &getBasicCredentialsMock{
+				storeUser:     "sillyUser",
+				storePassword: "password1234",
+			},
+			createRegistryDir: &createRegistryDirMock{
+				storeConfigDir: "vault",
+			},
+			simpleVerifyByPolicy: &simpleVerifyByPolicyMock{
+				retryErrs: []error{
+					errEOF,
+					errEOF,
+				},
+				err: errConRef,
+			},
+			wantDeny: nil,
+			wantErr:  fmt.Errorf("simple: %w", errConRef),
+		},
+		{
+			name:      "Return err if simple signing allowed after 1 fatal error",
+			namespace: "wibble",
+			imageName: "icr.io/wibble/some:tag",
+			policy: &policyv1.Policy{
+				Simple: policyv1.Simple{
+					Requirements: []policyv1.SimpleRequirement{
+						{
+							Type:      "test",
+							KeySecret: "noOneCares",
+						},
+					},
+					StoreURL:    "some.url.com",
+					StoreSecret: "someSecret1234",
+				},
+			},
+			transformPolicies: &transformPoliciesMock{},
+			getBasicCredentials: &getBasicCredentialsMock{
+				storeUser:     "sillyUser",
+				storePassword: "password1234",
+			},
+			createRegistryDir: &createRegistryDirMock{
+				storeConfigDir: "vault",
+			},
+			simpleVerifyByPolicy: &simpleVerifyByPolicyMock{
+				err: errNXDom,
+			},
+			wantDeny: nil,
+			wantErr:  fmt.Errorf("simple: %w", errNXDom),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -377,6 +487,14 @@ func Test_enforcer_DigestByPolicy(t *testing.T) {
 				require.NotNil(t, tt.createRegistryDir)
 				inConfigDir := tt.createRegistryDir.storeConfigDir
 				digest := bytes.NewBuffer([]byte(tt.simpleVerifyByPolicy.digest))
+				for _, err := range tt.simpleVerifyByPolicy.retryErrs {
+					var nilErr error
+					var nilBuf *bytes.Buffer
+					simpleVerifier.
+						On("VerifyByPolicy", tt.imageName, tt.credentials, inConfigDir, inPolicy).
+						Return(nilBuf, nilErr, err).
+						Once()
+				}
 				simpleVerifier.
 					On("VerifyByPolicy", tt.imageName, tt.credentials, inConfigDir, inPolicy).
 					Return(digest, tt.simpleVerifyByPolicy.deny, tt.simpleVerifyByPolicy.err).

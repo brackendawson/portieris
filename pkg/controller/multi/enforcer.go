@@ -16,6 +16,7 @@ package multi
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
 	"github.com/IBM/portieris/helpers/credential"
@@ -25,6 +26,7 @@ import (
 	"github.com/IBM/portieris/pkg/verifier/simple"
 	notaryverifier "github.com/IBM/portieris/pkg/verifier/trust"
 	"github.com/IBM/portieris/pkg/verifier/vulnerability"
+	"github.com/containers/common/pkg/retry"
 	"github.com/golang/glog"
 )
 
@@ -78,16 +80,28 @@ func (e enforcer) DigestByPolicy(namespace string, img *image.Reference, credent
 		if err != nil {
 			return nil, nil, err
 		}
-		digest, deny, err = e.sv.VerifyByPolicy(img.String(), credentials, storeConfigDir, simplePolicy)
+
+		// VerifyByPolicy is retried twice with no delay for retryable errors.
+		// 429 errors are retried internally by VerifyByPolicy and do use a
+		// backoff delay.
+		err = retry.RetryIfNecessary(context.Background(), func() error {
+			var err error
+			digest, deny, err = e.sv.VerifyByPolicy(img.String(), credentials, storeConfigDir, simplePolicy)
+			if err != nil {
+				glog.Error("Error verifying simple policy: ", err)
+			}
+			return err
+		}, &retry.RetryOptions{MaxRetry: 2})
 		if err != nil {
-			return nil, nil, fmt.Errorf("simple: %v", err)
+			return nil, nil, fmt.Errorf("simple: %w", err)
 		}
+
 		err = e.sv.RemoveRegistryDir(storeConfigDir)
 		if err != nil {
 			glog.Warningf("failed to remove %s, %v", storeConfigDir, err)
 		}
 		if deny != nil {
-			return nil, fmt.Errorf("simple: policy denied the request: %v", deny), nil
+			return nil, fmt.Errorf("simple: policy denied the request: %w", deny), nil
 		}
 	}
 
@@ -96,10 +110,10 @@ func (e enforcer) DigestByPolicy(namespace string, img *image.Reference, credent
 		var notaryDigest *bytes.Buffer
 		notaryDigest, deny, err = e.nv.VerifyByPolicy(namespace, img, credentials, policy)
 		if err != nil {
-			return nil, nil, fmt.Errorf("trust: %v", err)
+			return nil, nil, fmt.Errorf("trust: %w", err)
 		}
 		if deny != nil {
-			return nil, fmt.Errorf("trust: policy denied the request: %v", deny), nil
+			return nil, fmt.Errorf("trust: policy denied the request: %w", deny), nil
 		}
 		glog.Infof("DCT digest: %v", notaryDigest)
 		if notaryDigest != nil {
